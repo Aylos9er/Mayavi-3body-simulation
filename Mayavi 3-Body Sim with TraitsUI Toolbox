@@ -1,0 +1,269 @@
+import numpy as np
+
+from traits.api import HasTraits, Instance, Float, Int, Button, Bool, List, Array, observe
+from traitsui.api import View, Item, Group, HGroup, VGroup, Handler
+from pyface.timer.api import Timer # For the animation loop
+
+from mayavi import mlab
+from mayavi.core.ui.api import MlabSceneModel, SceneEditor
+from tvtk.api import tvtk # Traited VTK
+from mayavi.sources.api import ArraySource
+from mayavi.modules.api import Surface, Glyph, Tube, Stripper
+
+# --- Simulation Parameters (Defaults) ---
+DEFAULT_G = 1.0
+DEFAULT_DT = 0.001
+DEFAULT_N_STEPS_PER_FRAME = 10
+TRAIL_LENGTH = 300
+PRISMATIC_SCALAR_MAX = 100.0
+
+# --- Body Initial Conditions (Defaults) ---
+# These can be made into Traits as well for more advanced UI, but starting simpler
+initial_conditions_default = [
+    {'mass': 10.0, 'pos': np.array([-1.0, 0.0, 0.0]), 'vel': np.array([0.0, 0.55, 0.0]), 'color': (0.9, 0.4, 0.1), 'radius_scale': 0.07},
+    {'mass': 10.0, 'pos': np.array([1.0, 0.0, 0.0]), 'vel': np.array([0.0, -0.45, 0.0]), 'color': (0.4, 0.6, 0.9), 'radius_scale': 0.07},
+    {'mass': 12.0, 'pos': np.array([0.0, 1.7, 0.0]), 'vel': np.array([-0.85, 0.0, 0.1]), 'color': (0.9, 0.9, 0.9), 'radius_scale': 0.08}
+]
+
+class PhysicsBody:
+    """Holds the physics state of a body and its trail data."""
+    def __init__(self, mass, pos_init, vel_init):
+        self.mass = mass
+        self.pos = np.array(pos_init, dtype=float)
+        self.vel = np.array(vel_init, dtype=float)
+        
+        self.trail_points = np.zeros((TRAIL_LENGTH, 3))
+        self.trail_scalars = np.zeros(TRAIL_LENGTH)
+        self.trail_idx = 0
+        self.trail_len_actual = 0
+
+    def update_trail_data(self):
+        self.trail_points[self.trail_idx] = self.pos
+        self.trail_scalars[self.trail_idx] = (self.trail_idx / TRAIL_LENGTH) * PRISMATIC_SCALAR_MAX
+        self.trail_idx = (self.trail_idx + 1) % TRAIL_LENGTH
+        if self.trail_len_actual < TRAIL_LENGTH:
+            self.trail_len_actual += 1
+
+    def get_ordered_trail(self):
+        if self.trail_len_actual == TRAIL_LENGTH:
+            points = np.roll(self.trail_points, -self.trail_idx, axis=0)
+            scalars = np.roll(self.trail_scalars, -self.trail_idx, axis=0)
+        else:
+            points = self.trail_points[:self.trail_len_actual]
+            scalars = self.trail_scalars[:self.trail_len_actual]
+        return points, scalars
+
+class SimulationController(HasTraits):
+    # --- Mayavi Scene ---
+    scene = Instance(MlabSceneModel, ()) # Embeds the Mayavi scene
+
+    # --- Simulation Parameters (Traits for UI) ---
+    G = Float(DEFAULT_G, label="Gravity (G)")
+    DT = Float(DEFAULT_DT, label="Time Step (DT)")
+    n_steps_per_frame = Int(DEFAULT_N_STEPS_PER_FRAME, label="Steps/Frame")
+    
+    # --- Animation Control ---
+    start_button = Button("Start Simulation")
+    stop_button = Button("Stop Simulation")
+    reset_button = Button("Reset Simulation")
+    running = Bool(False) # Animation state
+
+    # --- Internal Simulation State ---
+    _physics_bodies = List(PhysicsBody) # List of our physics body objects
+    _body_sphere_sources = List(ArraySource)
+    _body_trail_sources = List(ArraySource)
+    _dust_source = Instance(ArraySource)
+    _timer = Instance(Timer) # Animation timer
+    _initial_conditions = List # To store the initial setup for reset
+
+    def __init__(self, initial_conditions, **traits):
+        super().__init__(**traits)
+        self._initial_conditions = initial_conditions # Store for reset
+        self._timer = Timer(interval=30, on_timer=self._on_timer_update) # Interval in ms
+        self.setup_scene_and_physics()
+
+    def setup_scene_and_physics(self):
+        """Initializes/Resets the Mayavi scene and physics bodies."""
+        self.scene.mlab.clf() # Clear the Mayavi scene
+
+        self._physics_bodies = []
+        self._body_sphere_sources = []
+        self._body_trail_sources = []
+
+        for i, cond in enumerate(self._initial_conditions):
+            # Create physics body
+            p_body = PhysicsBody(cond['mass'], cond['pos'], cond['vel'])
+            self._physics_bodies.append(p_body)
+
+            # --- Mayavi Pipeline for Body Sphere ---
+            sphere_source = ArraySource(scalar_data=np.array([0]))
+            sphere_source.trait_set(x=np.array([p_body.pos[0]]),
+                                    y=np.array([p_body.pos[1]]),
+                                    z=np.array([p_body.pos[2]]))
+            self._body_sphere_sources.append(sphere_source)
+            
+            glyph_module = Glyph()
+            self.scene.mlab.pipeline.add_module(glyph_module, obj=sphere_source)
+            radius = (p_body.mass**0.33) * cond['radius_scale']
+            glyph_module.glyph.glyph_source.glyph_source = tvtk.SphereSource(radius=radius, theta_resolution=16, phi_resolution=16)
+            glyph_module.glyph.scale_mode = 'data_scaling_off'
+            glyph_module.actor.property.color = cond['color']
+            glyph_module.actor.mapper.scalar_visibility = False
+
+            # --- Mayavi Pipeline for Trail ---
+            trail_source = ArraySource(scalar_data=p_body.trail_scalars[:1])
+            trail_source.trait_set(x=p_body.trail_points[:1, 0],
+                                   y=p_body.trail_points[:1, 1],
+                                   z=p_body.trail_points[:1, 2])
+            self._body_trail_sources.append(trail_source)
+
+            tube = self.scene.mlab.pipeline.tube(trail_source, tube_radius=0.02, tube_sides=8)
+            stripper = self.scene.mlab.pipeline.stripper(tube)
+            trail_surface = self.scene.mlab.pipeline.surface(stripper)
+            
+            trail_surface.actor.mapper.scalar_visibility = True
+            trail_surface.actor.mapper.scalar_range = (0, PRISMATIC_SCALAR_MAX)
+            trail_surface.actor.mapper.lookup_table.hue_range = (0.0, 1.0)
+            trail_surface.actor.mapper.lookup_table.saturation_range = (1.0, 1.0)
+            trail_surface.actor.mapper.lookup_table.value_range = (1.0, 1.0)
+            trail_surface.actor.mapper.lookup_table.build()
+        
+        # --- Particle Dust ---
+        N_DUST_PARTICLES = 5000 # Reduced for potentially better performance
+        dust_positions = (np.random.rand(N_DUST_PARTICLES, 3) - 0.5) * 30
+        dust_scalars = np.random.rand(N_DUST_PARTICLES) * 0.5 + 0.5
+        
+        self._dust_source = ArraySource(scalar_data=dust_scalars)
+        self._dust_source.trait_set(points=dust_positions)
+
+        dust_glyphs = Glyph()
+        self.scene.mlab.pipeline.add_module(dust_glyphs, obj=self._dust_source)
+        dust_glyphs.glyph.glyph_source.glyph_source = tvtk.SphereSource(radius=0.01, theta_resolution=3, phi_resolution=3)
+        dust_glyphs.glyph.scale_mode = 'data_scaling_off'
+        dust_glyphs.actor.mapper.scalar_visibility = True
+        dust_glyphs.actor.property.opacity = 0.20 # More subtle dust
+        dust_glyphs.module_manager.scalar_lut_manager.lut_mode = 'Greys' # Greyscale dust
+        dust_glyphs.module_manager.scalar_lut_manager.reverse_lut = True
+
+        self.scene.mlab.view(azimuth=45, elevation=50, distance=15, focalpoint=(0,0,0))
+        self.scene.mlab.roll(-90)
+        self.scene.render()
+
+
+    def _calculate_forces_physics(self): # Renamed to avoid conflict
+        num_bodies = len(self._physics_bodies)
+        forces = [np.zeros(3) for _ in range(num_bodies)]
+        for i in range(num_bodies):
+            for j in range(i + 1, num_bodies):
+                body_i = self._physics_bodies[i]
+                body_j = self._physics_bodies[j]
+                delta_pos = body_j.pos - body_i.pos
+                distance_sq = np.sum(delta_pos**2)
+                softening_factor_sq = 0.01 
+                distance_sq_softened = distance_sq + softening_factor_sq
+                distance = np.sqrt(distance_sq_softened)
+                if distance < 0.0001: force_magnitude = 0
+                else: force_magnitude = (self.G * body_i.mass * body_j.mass) / distance_sq_softened
+                force_vector = force_magnitude * (delta_pos / distance)
+                forces[i] += force_vector
+                forces[j] -= force_vector
+        return forces
+
+    def _update_physics_step(self):
+        forces = self._calculate_forces_physics()
+        for i, body in enumerate(self._physics_bodies):
+            acceleration = forces[i] / body.mass
+            body.vel += acceleration * self.DT
+            body.pos += body.vel * self.DT
+            body.update_trail_data()
+
+    def _update_visuals(self):
+        for i, p_body in enumerate(self._physics_bodies):
+            # Update sphere
+            self._body_sphere_sources[i].trait_set(x=np.array([p_body.pos[0]]),
+                                                  y=np.array([p_body.pos[1]]),
+                                                  z=np.array([p_body.pos[2]]))
+            # Update trail
+            ordered_points, ordered_scalars = p_body.get_ordered_trail()
+            if p_body.trail_len_actual > 1:
+                self._body_trail_sources[i].trait_set(
+                    points=ordered_points,
+                    scalar_data=ordered_scalars
+                )
+                self._body_trail_sources[i].data_changed = True
+        self.scene.render()
+
+    def _on_timer_update(self):
+        """Called by the timer to advance the simulation."""
+        if self.running:
+            for _ in range(self.n_steps_per_frame):
+                self._update_physics_step()
+            self._update_visuals()
+
+    # --- Button Handlers ---
+    def _start_button_fired(self):
+        print("Start button fired")
+        self.running = True
+        if not self._timer.is_running:
+            self._timer.start()
+
+    def _stop_button_fired(self):
+        print("Stop button fired")
+        self.running = False
+        if self._timer.is_running:
+            self._timer.stop()
+
+    def _reset_button_fired(self):
+        print("Reset button fired")
+        self.running = False
+        if self._timer.is_running:
+            self._timer.stop()
+        # Re-initialize scene and physics
+        self.setup_scene_and_physics() 
+        # self.scene.render() # Already called in setup_scene
+
+    # --- Trait Observers for Real-time Parameter Changes ---
+    @observe('G, DT, n_steps_per_frame')
+    def _parameter_changed(self, event):
+        print(f"Parameter changed: {event.name} = {event.new}")
+        # For G, DT, n_steps_per_frame, no immediate re-render needed,
+        # they will be picked up by the next physics step.
+
+    # --- TraitsUI View Definition ---
+    # This defines the layout of the GUI
+    view = View(
+        VGroup(
+            Item('scene', editor=SceneEditor(scene_class=MlabSceneModel),
+                 height=600, width=800, show_label=False), # Mayavi Scene
+            HGroup( # Horizontal group for controls
+                Group(
+                    Item('G'),
+                    Item('DT'),
+                    Item('n_steps_per_frame'),
+                    label="Simulation Parameters",
+                    show_border=True
+                ),
+                VGroup(
+                    Item('start_button', show_label=False),
+                    Item('stop_button', show_label=False),
+                    Item('reset_button', show_label=False),
+                    label="Controls",
+                    show_border=True
+                )
+            ),
+        ),
+        resizable=True,
+        title="Mayavi 3-Body Simulation Toolbox"
+    )
+
+
+# --- Main Application Execution ---
+if __name__ == '__main__':
+    print("Initializing Mayavi 3-Body Simulation with TraitsUI Toolbox...")
+    print("Ensure Mayavi, Traits, TraitsUI, NumPy, and a Qt backend (e.g., PyQt5) are installed.")
+    
+    simulation_controller = SimulationController(initial_conditions=initial_conditions_default)
+    simulation_controller.configure_traits() # This launches the TraitsUI application
+
+    print("TraitsUI window closed. Simulation ended.")
+
