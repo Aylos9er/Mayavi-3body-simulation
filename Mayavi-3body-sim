@@ -1,0 +1,203 @@
+    # Filename: mayavi_advanced_3body_sim.py
+    import numpy as np
+    from mayavi import mlab
+    from tvtk.api import tvtk # Traited VTK
+    from mayavi.sources.api import ArraySource
+    from mayavi.modules.api import Surface, Glyph, Tube, Stripper
+
+    # --- Simulation Parameters ---
+    G = 1.0  # Gravitational constant
+    DT = 0.001  # Time step for simulation
+    N_STEPS_PER_FRAME = 10 # Number of simulation steps per animation frame
+    TRAIL_LENGTH = 400    # Max number of points in a trail
+    PRISMATIC_SCALAR_MAX = 100.0 # Max value for scalar that drives prismatic trail color
+
+    # --- Body Initial Conditions ---
+    masses_init = [10.0, 10.0, 12.0] 
+    positions_init = [
+        np.array([-1.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.7, 0.0])
+    ]
+    velocities_init = [
+        np.array([0.0, 0.55, 0.0]),
+        np.array([0.0, -0.45, 0.0]),
+        np.array([-0.85, 0.0, 0.1]) 
+    ]
+    colors_init = [
+        (0.9, 0.4, 0.1), # Orange
+        (0.4, 0.6, 0.9), # Light Blue
+        (0.9, 0.9, 0.9)  # White/Light Grey
+    ]
+    radius_scales_init = [0.07, 0.07, 0.08]
+
+
+    class Body:
+        def __init__(self, scene, mass, pos_init, vel_init, color, radius_scale=0.05):
+            self.mass = mass
+            self.pos = np.array(pos_init, dtype=float)
+            self.vel = np.array(vel_init, dtype=float)
+            self.color = color
+            self.radius = (mass**0.33) * radius_scale
+            
+            self.trail_points = np.zeros((TRAIL_LENGTH, 3)) 
+            self.trail_scalars = np.zeros(TRAIL_LENGTH)    
+            self.trail_idx = 0 
+            self.trail_len_actual = 0 
+
+            # --- Mayavi Pipeline for the Body Sphere ---
+            self.sphere_source = ArraySource(scalar_data=np.array([0])) 
+            self.sphere_source.edit_traits(x=np.array([self.pos[0]]),
+                                           y=np.array([self.pos[1]]),
+                                           z=np.array([self.pos[2]]))
+            
+            glyph_module = Glyph()
+            scene.add_module(glyph_module, obj=self.sphere_source)
+            glyph_module.glyph.glyph_source.glyph_source = tvtk.SphereSource(radius=self.radius, theta_resolution=16, phi_resolution=16)
+            glyph_module.glyph.scale_mode = 'data_scaling_off' 
+            glyph_module.actor.property.color = self.color
+            glyph_module.actor.mapper.scalar_visibility = False 
+
+            self.mlab_object_glyph_module = glyph_module 
+
+            # --- Mayavi Pipeline for the Trail ---
+            self.trail_source = ArraySource(scalar_data=self.trail_scalars[:1]) 
+            self.trail_source.edit_traits(x=self.trail_points[:1, 0],
+                                          y=self.trail_points[:1, 1],
+                                          z=self.trail_points[:1, 2])
+            
+            tube_filter = Tube(module_manager=scene.engine.module_manager)
+            tube_filter.filter.radius = 0.02
+            tube_filter.filter.number_of_sides = 8
+            scene.engine.add_filter(tube_filter, self.trail_source) 
+
+            stripper = Stripper(module_manager=scene.engine.module_manager)
+            scene.engine.add_filter(stripper, tube_filter) 
+
+            trail_surface = Surface()
+            scene.add_module(trail_surface, obj=stripper) 
+            trail_surface.actor.mapper.scalar_visibility = True 
+            trail_surface.actor.mapper.scalar_range = (0, PRISMATIC_SCALAR_MAX)
+            trail_surface.actor.mapper.lookup_table.hue_range = (0.0, 1.0) 
+            trail_surface.actor.mapper.lookup_table.saturation_range = (1.0, 1.0)
+            trail_surface.actor.mapper.lookup_table.value_range = (1.0, 1.0)
+            trail_surface.actor.mapper.lookup_table.build()
+            
+            self.mlab_trail_surface_module = trail_surface 
+
+        def update_visuals(self):
+            """Updates the Mayavi ArraySources for the body and its trail."""
+            self.sphere_source.trait_set(x=np.array([self.pos[0]]),
+                                         y=np.array([self.pos[1]]),
+                                         z=np.array([self.pos[2]]))
+
+            self.trail_points[self.trail_idx] = self.pos
+            self.trail_scalars[self.trail_idx] = (self.trail_idx / TRAIL_LENGTH) * PRISMATIC_SCALAR_MAX 
+            
+            self.trail_idx = (self.trail_idx + 1) % TRAIL_LENGTH
+            if self.trail_len_actual < TRAIL_LENGTH:
+                self.trail_len_actual += 1
+
+            if self.trail_len_actual == TRAIL_LENGTH:
+                ordered_points = np.roll(self.trail_points, -self.trail_idx, axis=0)
+                ordered_scalars = np.roll(self.trail_scalars, -self.trail_idx, axis=0)
+            else:
+                ordered_points = self.trail_points[:self.trail_len_actual]
+                ordered_scalars = self.trail_scalars[:self.trail_len_actual]
+            
+            if self.trail_len_actual > 1:
+                self.trail_source.trait_set(
+                    points=ordered_points, 
+                    scalar_data=ordered_scalars
+                )
+                self.trail_source.data_changed = True
+
+
+    # --- Physics Calculation ---
+    def calculate_forces(bodies_list):
+        num_bodies = len(bodies_list)
+        forces = [np.zeros(3) for _ in range(num_bodies)]
+        for i in range(num_bodies):
+            for j in range(i + 1, num_bodies):
+                body_i = bodies_list[i]
+                body_j = bodies_list[j]
+                delta_pos = body_j.pos - body_i.pos
+                distance_sq = np.sum(delta_pos**2)
+                softening_factor_sq = 0.01 
+                distance_sq_softened = distance_sq + softening_factor_sq
+                distance = np.sqrt(distance_sq_softened)
+                if distance < 0.0001: force_magnitude = 0
+                else: force_magnitude = (G * body_i.mass * body_j.mass) / distance_sq_softened
+                force_vector = force_magnitude * (delta_pos / distance)
+                forces[i] += force_vector
+                forces[j] -= force_vector
+        return forces
+
+    def update_physics(bodies_list, dt_sim):
+        forces = calculate_forces(bodies_list)
+        for i, body in enumerate(bodies_list):
+            acceleration = forces[i] / body.mass
+            body.vel += acceleration * dt_sim
+            body.pos += body.vel * dt_sim
+
+    # --- Mayavi Scene Setup ---
+    fig = mlab.figure(size=(1200, 900), bgcolor=(0.02, 0.02, 0.05), fgcolor=(1,1,1)) 
+    mlab.clf()
+    scene = mlab.get_engine().current_scene 
+
+    bodies = [
+        Body(scene, masses_init[0], positions_init[0], velocities_init[0], colors_init[0], radius_scales_init[0]),
+        Body(scene, masses_init[1], positions_init[1], velocities_init[1], colors_init[1], radius_scales_init[1]),
+        Body(scene, masses_init[2], positions_init[2], velocities_init[2], colors_init[2], radius_scales_init[2])
+    ]
+
+    # --- Create Particle Dust using pipeline ---
+    N_DUST_PARTICLES = 8000
+    dust_initial_positions = (np.random.rand(N_DUST_PARTICLES, 3) - 0.5) * 30 
+    dust_scalars = np.random.rand(N_DUST_PARTICLES) * 0.5 + 0.5 
+
+    dust_source = ArraySource(scalar_data=dust_scalars)
+    dust_source.edit_traits(points=dust_initial_positions) 
+
+    dust_glyphs = Glyph()
+    scene.add_module(dust_glyphs, obj=dust_source)
+    dust_glyphs.glyph.glyph_source.glyph_source = tvtk.SphereSource(radius=0.01, theta_resolution=3, phi_resolution=3) 
+    dust_glyphs.glyph.scale_mode = 'data_scaling_off' 
+    dust_glyphs.actor.mapper.scalar_visibility = True
+    dust_glyphs.actor.property.opacity = 0.25
+    dust_glyphs.module_manager.scalar_lut_manager.lut_mode = 'Blues' 
+    dust_glyphs.module_manager.scalar_lut_manager.reverse_lut = True
+
+
+    # --- Animation Loop ---
+    frame_count = 0
+
+    @mlab.animate(delay=30)
+    def anim():
+        global frame_count
+        while True:
+            for _ in range(N_STEPS_PER_FRAME):
+                update_physics(bodies, DT)
+
+            for body in bodies:
+                body.update_visuals()
+            
+            frame_count +=1
+            fig.scene.render() 
+            yield
+
+    # --- Main execution block ---
+    if __name__ == '__main__':
+        mlab.view(azimuth=45, elevation=50, distance=15, focalpoint=(0,0,0))
+        mlab.roll(-90)
+
+        print("Starting Advanced Mayavi 3-Body Simulation...")
+        print("This uses a more direct Mayavi/VTK pipeline approach.")
+        print("Ensure Mayavi and its dependencies (VTK, PyQt5/PySide2) are installed.")
+        print("Close the Mayavi window to stop the simulation.")
+
+        animation_instance = anim()
+        mlab.show()
+
+        print("Simulation finished.")
+    
